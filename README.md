@@ -37,7 +37,7 @@ app/
 │       ├── TimelineWeatherService.php  # Получение прогноза
 │       ├── SubscribeService.php        # Подписки
 │       └── MessageBuilder.php          # Шаблоны сообщений
-
+```
 ---
 ## Ссылка
 
