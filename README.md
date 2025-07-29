@@ -41,4 +41,4 @@ app/
 ---
 ## Ссылка
 
-[text](https://t.me/Cognitive2005_bot)
+[Ссылка на бота](https://t.me/Cognitive2005_bot)
