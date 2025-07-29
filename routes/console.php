@@ -1,8 +1,12 @@
 <?php
 
-use Illuminate\Foundation\Inspiring;
-use Illuminate\Support\Facades\Artisan;
+use App\Console\Commands\SendMorningForecast;
+use Illuminate\Support\Facades\Schedule;
 
-Artisan::command('inspire', function () {
-    $this->comment(Inspiring::quote());
-})->purpose('Display an inspiring quote');
+// Schedule::command(SendMorningForecast::class)
+//     ->timezone('Europe/Moscow')
+//     ->dailyAt('7:00');
+
+Schedule::command(SendMorningForecast::class)
+    ->timezone('Europe/Moscow')
+    ->everyMinute();

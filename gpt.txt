@@ -1,0 +1,433 @@
+<?php
+
+namespace App\Telegram;
+
+use App\Services\Weather\MessageBuilder;
+use App\Services\Weather\TimelineWeatherService;
+use App\Services\Weather\SubscribeService;
+use DefStudio\Telegraph\Contracts\Storable;
+use DefStudio\Telegraph\Handlers\WebhookHandler;
+
+use Log;
+
+class Handler extends WebhookHandler implements Storable
+{
+    use \DefStudio\Telegraph\Concerns\HasStorage;
+
+    private const STATE_USER_ACTION_KEY = 'action'; 
+    private const ACTION_WEATHER = "weather";
+    private const ACTION_SUBSCRIBE = "subscribe";
+
+    private SubscribeService $subscribeService; // Cервис подписок
+    private TimelineWeatherService $weatherService; // Сервис получения прогноза погоды
+
+    public function __construct(SubscribeService $subscribeService, TimelineWeatherService $weatherService)
+    {
+        $this->subscribeService = $subscribeService;
+        $this->weatherService = $weatherService;
+    }
+
+    public function storageKey(): string|int
+    {
+        return $this->chat->chat_id; // Используем ID чата как ID хранилища состояния
+    }
+
+    public function start() 
+    {   
+        $this->sendWithKeyboard(
+            MessageBuilder::startMessage()
+        );
+    }
+
+    public function weather()
+    {
+        $this->chat->storage()->forget(self::STATE_USER_ACTION_KEY);
+        $this->chat->storage()->set(self::STATE_USER_ACTION_KEY, self::ACTION_WEATHER);
+        $this->chat->message(MessageBuilder::askLocation())->send();
+    }
+
+    public function subscribe()
+    {
+        $this->chat->storage()->set(self::STATE_USER_ACTION_KEY, self::ACTION_SUBSCRIBE);
+
+        $subscribe = $this->subscribeService->getSubscribe($this->chat->chat_id); // Получение подписки по id чата
+
+        if($subscribe)
+        {
+            $this->sendWithKeyboard(
+                MessageBuilder::subscribeAlreadyExists($subscribe->location)
+            );
+            
+            return;
+        } 
+
+        $this->chat
+            ->message(MessageBuilder::askLocation())
+            ->send();
+    }
+
+    public function handleChatMessage(\Illuminate\Support\Stringable $location): void
+    {   
+        $action = $this->chat->storage()->get(self::STATE_USER_ACTION_KEY);
+
+        switch ($action) {
+            case self::ACTION_WEATHER :
+                
+                $this->sendWithKeyboard(
+                    $this->getWeatherForecast($location)
+                );
+                break;
+
+            case self::ACTION_SUBSCRIBE :
+
+                    $subscribe = $this->subscribeService->getSubscribe($this->chat->chat_id);
+
+                    if(!$subscribe)
+                    {
+                        try {
+                            $weatherData = $this->getWeatherForecast($location);
+
+                            $subscribe = $this->subscribeService->create($this->chat->chat_id, $location);
+
+                            $this->sendWithKeyboard(
+                                MessageBuilder::successSubscribe($subscribe->location)
+                            );
+                        
+                            $this->chat->storage()->forget(self::STATE_USER_ACTION_KEY);
+                        } catch (\Throwable $e) {
+                            Log::error('Ошибка при получении погоды', [
+                                'location' => $location,
+                                'error' => $e->getMessage(),
+                            ]);
+                            $this->sendWithKeyboard(MessageBuilder::apiErrorMessage());
+                        }
+                        
+                    }
+                    
+                break;
+            
+            default:
+
+                $this->sendWithKeyboard('Команда не распознана');
+                $this->chat->storage()->forget(self::STATE_USER_ACTION_KEY);
+                break;
+        }
+    }
+
+    public function unsubscribe()
+    {
+        $subscribe = $this->subscribeService->getSubscribe($this->chat->chat_id);
+
+        if($subscribe)
+        {
+            if($this->subscribeService->delete($subscribe))
+            {
+                $this->sendWithKeyboard(
+                    MessageBuilder::declineSubscribe()
+                );
+
+                return;
+            }
+
+            return;
+        }
+
+        $this->sendWithKeyboard(MessageBuilder::subscribeNotExists());
+    }
+
+    public function status()
+    {
+        $subscribe = $this->subscribeService->getSubscribe($this->chat->chat_id);
+
+        if($subscribe)
+        {
+            $this->sendWithKeyboard(
+                MessageBuilder::subscribeAlreadyExists($subscribe->location)
+            );
+
+            return;
+        }
+
+        $this->sendWithKeyboard(
+            MessageBuilder::subscribeNotExists()
+        );
+    }
+
+    public function handleUnknownCommand(\Illuminate\Support\Stringable $text): void
+    {
+        $this->sendWithKeyboard(
+            MessageBuilder::unknownCommand()
+        );
+    }
+        
+    private function getWeatherForecast(string $location): string
+    {
+        try {
+            $data = $this->weatherService->getWeatherData($location);
+        } catch (\Throwable $e) {
+            Log::error('Ошибка при получении погоды', [
+                'location' => $location,
+                'error' => $e->getMessage(),
+            ]);
+            return MessageBuilder::apiErrorMessage();
+        }
+        
+        return MessageBuilder::weatherMessage($data);
+    }
+
+    private function sendWithKeyboard(string $text)
+    {
+        $this->chat
+            ->message($text)
+            ->keyboard(MessageBuilder::keyboard())
+            ->send();
+    }
+}
+
+
+
+<?php
+
+namespace App\Console\Commands;
+
+use App\Models\Subscribe;
+use App\Services\Weather\MessageBuilder;
+use App\Services\Weather\TimelineWeatherService;
+use Illuminate\Console\Command;
+
+class SendMorningForecast extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = 'app:send-morning-forecast';
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = 'Command description';
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(TimelineWeatherService $weatherService)
+    {
+        $subscribes = Subscribe::with('chat')->get();
+
+        foreach ($subscribes as $subscribe) {
+            $chat = $subscribe->chat;
+
+            if (!$chat) continue;
+
+            try {
+                $weatherData = $weatherService->getWeatherData($subscribe->location);
+                
+                $chat->message(MessageBuilder::morningMessage($weatherData))
+                    ->keyboard(MessageBuilder::keyboard())
+                    ->send();
+                    
+            } catch (\Exception $e) {
+                $this->error("Ошибка для чата {$subscribe->chat_id}: " . $e->getMessage());
+                \Log::error("Утренний прогноз: {$subscribe->chat_id} - " . $e->getMessage());
+            }
+        }
+    }
+    
+}
+
+
+<?php
+
+namespace App\Services\Weather;
+
+use DefStudio\Telegraph\Keyboard\Button;
+use DefStudio\Telegraph\Keyboard\Keyboard;
+
+class MessageBuilder
+{
+    public static function startMessage(): string
+    {
+        return "Привет! Я бот <b>Cognitive</b>.\n\n" .
+            "Я помогу тебе узнать погоду в любом городе и отправлять прогноз каждое утро.\n\n" .
+            "Вот что я умею:\n" .
+            "/weather — показать погоду на день\n" .
+            "/subscribe — подписка на ежедневный прогноз\n" .
+            "/unsubscribe — отменить подписку\n" .
+            "/status — показать текущие подписки";
+    }
+
+    public static function weatherMessage(array $data): string
+    {
+        $rainfallText = $data['rainfall'] > 0 
+            ? "🌧 Осадки: {$data['rainfall']} мм" 
+            : "☔ Без осадков";
+        
+        return "🌤 <b>Погода в {$data['address']}</b>\n\n"
+            . "🌡 Температура:\n"
+            . "  • Средняя: <b>{$data['avg_temperature']}°C</b>\n"
+            . "  • Максимальная: <b>{$data['max_temperature']}°C</b>\n\n"
+            . "💨 Ветер: <b>{$data['windspeed']} км/ч</b>\n"
+            . "☁️ Облачность: <b>{$data['cloudcover']}%</b>\n"
+            . $rainfallText;
+    }
+
+    public static function morningMessage(array $data): string
+    {
+        $rainfallText = $data['rainfall'] > 0 
+            ? "🌧 Осадки: {$data['rainfall']} мм" 
+            : "☔ Без осадков";
+        
+        return "Доброе утро!\n\n"
+            . "🌤 <b>Погода в {$data['address']} сегодня:</b>\n\n"
+            . "🌡 Температура:\n"
+            . "  • Средняя: <b>{$data['avg_temperature']}°C</b>\n"
+            . "  • Максимальная: <b>{$data['max_temperature']}°C</b>\n\n"
+            . "💨 Ветер: <b>{$data['windspeed']} км/ч</b>\n"
+            . "☁️ Облачность: <b>{$data['cloudcover']}%</b>\n"
+            . $rainfallText
+            . "\n\nУдачного дня!";
+    }
+
+    public static function askLocation(): string
+    {
+        return "Укажите населённый пункт\n\nНапример: <i>Тамань, Темрюкский район</i>";
+    }
+
+    public static function successSubscribe(string $location): string
+    {
+        return "✅ Подписка на утреннюю рассылку по адресу <i>{$location}</i> оформлена!\n\nДля отмены используйте команду /unsubscribe";
+    }
+
+    public static function subscribeAlreadyExists(string $location): string
+    {
+        return "ℹ️ У вас уже есть подписка по адресу <i>{$location}</i>\n\nДля отмены используйте команду /unsubscribe";
+    }
+
+    public static function subscribeNotExists(): string
+    {
+        return "ℹ️ У вас нет активных подписок";
+    }
+
+    public static function unknownCommand():string
+    {
+        return "ℹ️ Неизвестная команда";
+    }
+
+    public static function declineSubscribe(): string
+    {
+        return "✅ Подписка отменена";
+    }
+
+    public static function apiErrorMessage(): string
+    {
+        return "❌ Указанная локация не найдена или сервис погоды временно недоступен. Пожалуйста, проверьте название и попробуйте снова.";
+    }
+
+    public static function keyboard()
+    {
+        $keyboard = Keyboard::make()
+        ->buttons([
+            Button::make('✉️ Подписаться')->action('subscribe'),
+            Button::make('🌤 Погода')->action('weather'),
+            Button::make('❌ Отписаться')->action('unsubscribe'),
+            Button::make('ℹ️ Статус')->action('status'),
+            Button::make('🆘 Помощь')->action('start'),
+        ])
+        ->chunk(2)
+        ->rightToLeft();
+
+        return $keyboard;
+    }
+}
+
+<?php
+
+use App\Console\Commands\SendMorningForecast;
+use Illuminate\Support\Facades\Schedule;
+
+Schedule::command(SendMorningForecast::class)->dailyAt('7:00');
+
+
+<?php
+
+namespace App\Services\Weather;
+
+use App\Models\Subscribe;
+use Illuminate\Support\Facades\Log;
+
+class SubscribeService
+{
+    public function getSubscribe(string $chat_id): ?Subscribe
+    {
+        return Subscribe::where('chat_id', $chat_id)->first();
+    }
+
+    public function create(string $chat_id, string $location): Subscribe
+    {
+        try {
+            return Subscribe::create([
+                'chat_id' => $chat_id,
+                'location' => $location,
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Subscription creation failed for {$chat_id}: " . $e->getMessage());
+            throw $e;
+        }
+    }
+
+    public function delete(Subscribe $subscribe): bool
+    {
+        try {
+            return $subscribe->delete();
+        } catch (\Exception $e) {
+            Log::error("Subscription deletion failed for {$subscribe->chat_id}: " . $e->getMessage());
+            throw $e;
+        }
+    }
+}
+
+
+<?php
+
+namespace App\Services\Weather;
+
+use Illuminate\Database\Eloquent\Casts\Json;
+use Illuminate\Support\Facades\Http;
+use Log;
+
+class TimelineWeatherService
+{
+    private $endpoint;
+    private $token;
+
+    public function __construct()
+    {
+        $this->endpoint = config('services.timeline.endpoint');
+        $this->token = config('services.timeline.api_key');
+    }
+
+    public function getWeatherData(string $location)
+    {
+        $url = $this->endpoint . $location;
+
+        $response = Http::get($url, [
+            'key' => $this->token,
+            'unitGroup' => 'metric',
+        ])->json();
+
+        $weather_data = [
+            'address' => $response['resolvedAddress'],
+            'avg_temperature' => $response['days'][0]['temp'],
+            'max_temperature' => $response['days'][0]['tempmax'],
+            'windspeed' => $response['days'][0]['windspeed'],
+            'cloudcover' => $response['days'][0]['cloudcover'],
+            'rainfall' => $response['days'][0]['precip'],
+        ];
+        
+        return $weather_data;     
+    }
+}
