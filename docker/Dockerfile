@@ -8,9 +8,4 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /var/www/html
 
-# ОБЯЗАТЕЛЬНО ВЫПОЛНИТЬ В КОНТЕЙНЕРЕ LARAVEL
-
-# chown -R www-data:www-data /var/www/html/storage &&
-# chown -R www-data:www-data /var/www/html/bootstrap/cache
-
-# RUN composer install
+RUN 
